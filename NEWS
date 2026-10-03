@@ -1,6 +1,20 @@
 Queuelib release notes
 ======================
 
+Version 1.11.0
+--------------
+(unreleased)
+
+* Added a ``shared`` argument to ``FifoSQLiteQueue`` and
+  ``LifoSQLiteQueue`` to use the same database file from several queue
+  objects at once, including from different processes. In shared mode
+  ``pop()`` is atomic (an item is read and deleted in one transaction and
+  returned only after it commits) and ``close()`` keeps the database file
+  even when it is empty
+* Added a ``lock_timeout`` argument to ``FifoSQLiteQueue`` and
+  ``LifoSQLiteQueue`` to bound the wait for a database lock; a timeout now
+  raises ``sqlite3.OperationalError`` instead of looking like an empty queue
+
 Version 1.10.0
 ---------------
 (released on 2026-08-24)

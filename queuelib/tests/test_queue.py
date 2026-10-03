@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import multiprocessing
+import sqlite3
+import traceback
 from abc import abstractmethod
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -15,6 +19,76 @@ from queuelib import (
 )
 from queuelib.queue import BaseQueue
 from queuelib.tests import DummyQueue, QueuelibTestCase
+
+
+def _shared_queue_consumer(
+    path: str,
+    lifo: bool,
+    start: multiprocessing.synchronize.Barrier,
+    rounds: int,
+    round_barrier: multiprocessing.synchronize.Barrier,
+    drain_done: multiprocessing.synchronize.Barrier,
+    closed: multiprocessing.synchronize.Event,
+    can_push: multiprocessing.synchronize.Event,
+    results: multiprocessing.Queue,
+) -> None:
+    """Shared-mode partner that pops concurrently and then keeps writing."""
+    try:
+        cls = LifoSQLiteQueue if lifo else FifoSQLiteQueue
+        q = cls(path, shared=True)
+        start.wait()
+        items: list[bytes] = []
+        for _ in range(rounds):
+            round_barrier.wait()
+            item = q.pop()
+            assert item is not None
+            items.append(item)
+        drain_done.wait()
+        assert q.pop() is None
+        closed.wait()
+        assert Path(path).exists()
+        can_push.wait()
+        q.push(b"extra")
+        assert q.pop() == b"extra"
+        q.push(b"")
+        assert q.pop() == b""
+        assert q.pop() is None
+        q.close()
+        results.put(("items", items))
+    except BaseException:  # noqa: BLE001
+        results.put(("error", traceback.format_exc()))
+
+
+def _shared_queue_closer(
+    path: str,
+    lifo: bool,
+    start: multiprocessing.synchronize.Barrier,
+    rounds: int,
+    round_barrier: multiprocessing.synchronize.Barrier,
+    drain_done: multiprocessing.synchronize.Barrier,
+    closed: multiprocessing.synchronize.Event,
+    can_push: multiprocessing.synchronize.Event,
+    results: multiprocessing.Queue,
+) -> None:
+    """Shared-mode partner that pops concurrently and then closes while empty."""
+    try:
+        cls = LifoSQLiteQueue if lifo else FifoSQLiteQueue
+        q = cls(path, shared=True)
+        start.wait()
+        items: list[bytes] = []
+        for _ in range(rounds):
+            round_barrier.wait()
+            item = q.pop()
+            assert item is not None
+            items.append(item)
+        drain_done.wait()
+        q.close()
+        assert Path(path).exists()
+        closed.set()
+        can_push.set()
+        results.put(("items", items))
+    except BaseException:  # noqa: BLE001
+        results.put(("error", traceback.format_exc()))
 
 
 class InterfaceTest(QueuelibTestCase):
@@ -433,3 +507,200 @@ class LifoSQLiteQueueTest(
 ):
     def queue(self):
         return LifoSQLiteQueue(self.qpath)
+
+
+class SharedSQLiteTestMixin:
+    """Tests for SQLite queues opened by more than one connection."""
+
+    lifo = False
+    item_count = 100
+
+    def shared_queue(self, **kwargs):
+        cls = LifoSQLiteQueue if self.lifo else FifoSQLiteQueue
+        return cls(self.qpath, shared=True, **kwargs)
+
+    def test_shared_close_keeps_empty_file(self):
+        """close() in shared mode never deletes the database file."""
+        q = self.shared_queue()
+        q.push(b"a")
+        q.pop()
+        q.close()
+        assert self.qpath.exists()
+        q2 = self.shared_queue()
+        assert q2.pop() is None
+        q2.close()
+        assert self.qpath.exists()
+
+    def test_empty_bytes_distinct_from_no_record(self):
+        q = self.shared_queue()
+        assert q.pop() is None
+        q.push(b"")
+        assert q.peek() == b""
+        assert q.pop() == b""
+        assert q.pop() is None
+        q.close()
+        assert self.qpath.exists()
+
+    def test_two_connections_pop_each_item_once(self):
+        rounds = self.item_count // 2
+        q = self.shared_queue()
+        for index in range(self.item_count):
+            q.push(str(index).encode())
+
+        other = self.shared_queue()
+        try:
+            first = []
+            second = []
+            for _ in range(rounds):
+                first.append(q.pop())
+                second.append(other.pop())
+        finally:
+            other.close()
+        popped = [item for item in first + second if item is not None]
+        assert len(popped) == self.item_count
+        assert len(set(popped)) == self.item_count
+        assert q.pop() is None
+        q.close()
+
+    def test_lock_timeout_raises_not_none(self):
+        """A busy database raises instead of looking like an empty queue."""
+        q = self.shared_queue(lock_timeout=0.1)
+        q.push(b"a")
+        holder = sqlite3.connect(self.qpath, timeout=0)
+        holder.execute("BEGIN EXCLUSIVE")
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                q.pop()
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        assert q.pop() == b"a"
+        q.close()
+
+    def test_failed_commit_keeps_item(self):
+        """If committing a pop fails, the item is not handed out or lost."""
+        q = self.shared_queue(lock_timeout=0.1)
+        q.push(b"a")
+        holder = sqlite3.connect(self.qpath, timeout=0)
+        holder.execute("BEGIN EXCLUSIVE")
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                q.pop()
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        assert q.pop() == b"a"
+        assert q.pop() is None
+        q.close()
+
+    def test_shared_across_processes(self):
+        """Two processes pop under a barrier; one closes, the other keeps on.
+
+        Every input marker must be returned exactly once, closing an empty
+        shared queue must keep the file, and the temporary database file must
+        be removable explicitly at the end.
+        """
+        rounds = self.item_count // 2
+        q = self.shared_queue()
+        for index in range(self.item_count):
+            q.push(str(index).encode())
+        q.close()
+
+        ctx = multiprocessing.get_context("spawn")
+        start = ctx.Barrier(2)
+        round_barrier = ctx.Barrier(2)
+        drain_done = ctx.Barrier(2)
+        closed = ctx.Event()
+        can_push = ctx.Event()
+        results = ctx.Queue()
+        closer = ctx.Process(
+            target=_shared_queue_closer,
+            args=(
+                str(self.qpath),
+                self.lifo,
+                start,
+                rounds,
+                round_barrier,
+                drain_done,
+                closed,
+                can_push,
+                results,
+            ),
+        )
+        consumer = ctx.Process(
+            target=_shared_queue_consumer,
+            args=(
+                str(self.qpath),
+                self.lifo,
+                start,
+                rounds,
+                round_barrier,
+                drain_done,
+                closed,
+                can_push,
+                results,
+            ),
+        )
+        closer.start()
+        consumer.start()
+        closer.join(60)
+        consumer.join(60)
+
+        assert closer.exitcode == 0
+        assert consumer.exitcode == 0
+
+        batches = []
+        while not results.empty():
+            kind, value = results.get()
+            assert kind == "items", value
+            batches.append(value)
+        assert len(batches) == 2
+
+        popped = sorted(int(item) for batch in batches for item in batch)
+        assert len(popped) == self.item_count
+        assert len(set(popped)) == self.item_count
+        assert popped == list(range(self.item_count))
+
+        # The closer closed an empty shared queue: the file must survive and
+        # the database must be reusable by a fresh queue object.
+        assert self.qpath.exists()
+        q = self.shared_queue()
+        assert len(q) == 0
+        assert q.pop() is None
+        q.close()
+
+        # Shared mode never removes the file, so clean it up explicitly.
+        self.qpath.unlink()
+        assert not self.qpath.exists()
+
+
+class FifoSQLiteSharedQueueTest(SharedSQLiteTestMixin, QueuelibTestCase):
+    lifo = False
+
+    def test_shared_fifo_ordering(self):
+        closer = self.shared_queue()
+        other = self.shared_queue()
+        for item in [b"a", b"b", b"c", b"d"]:
+            closer.push(item)
+        assert closer.pop() == b"a"
+        assert other.pop() == b"b"
+        assert closer.pop() == b"c"
+        assert other.pop() == b"d"
+        closer.close()
+        other.close()
+
+
+class LifoSQLiteSharedQueueTest(SharedSQLiteTestMixin, QueuelibTestCase):
+    lifo = True
+
+    def test_shared_lifo_ordering(self):
+        closer = self.shared_queue()
+        other = self.shared_queue()
+        for item in [b"a", b"b", b"c", b"d"]:
+            closer.push(item)
+        assert closer.pop() == b"d"
+        assert other.pop() == b"c"
+        assert closer.pop() == b"b"
+        assert other.pop() == b"a"
+        closer.close()
+        other.close()

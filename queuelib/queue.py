@@ -296,45 +296,84 @@ class FifoSQLiteQueue:
     _sql_del = "DELETE FROM queue WHERE id = ?"
     _sql_clear = "DELETE FROM queue"
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        shared: bool = False,
+        lock_timeout: float = 60,
+    ) -> None:
+        """Open the queue stored at *path*.
+
+        Set *shared* to ``True`` when more than one queue object (in the
+        same process or in different processes) uses *path* at the same
+        time. In shared mode every ``pop()`` is atomic across connections
+        and ``close()`` never deletes an empty database file, since another
+        connection may still need it.
+
+        *lock_timeout* is the maximum number of seconds to wait for a
+        database lock held by another connection before raising
+        ``sqlite3.OperationalError``. A lock timeout is always raised, never
+        reported as an empty queue.
+        """
+        self._shared = shared
         self._path = Path(path).resolve()
-        self._db = sqlite3.Connection(self._path, timeout=60)
+        # Autocommit mode (isolation_level=None): transactions are started
+        # explicitly, so pop() can take a RESERVED lock with BEGIN IMMEDIATE
+        # before reading, making select-and-delete atomic across connections.
+        self._db = sqlite3.Connection(
+            self._path, timeout=lock_timeout, isolation_level=None
+        )
         self._db.text_factory = bytes
-        with self._db as conn:
-            conn.execute(self._sql_create)
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.execute(self._sql_create)
+            self._db.execute("COMMIT")
+        except BaseException:  # noqa: BLE001
+            with suppress(Exception):
+                self._db.execute("ROLLBACK")
+            raise
 
     def push(self, item: bytes) -> None:
         if not isinstance(item, bytes):
             raise TypeError(f"Unsupported type: {type(item).__name__}")
-        with self._db as conn:
-            conn.execute(self._sql_push, (item,))
+        self._db.execute(self._sql_push, (item,))
 
     def pop(self) -> bytes | None:
-        with self._db as conn:
-            for id_, item in conn.execute(self._sql_pop):
-                conn.execute(self._sql_del, (id_,))
-                return cast("bytes", item)
-        return None
+        # BEGIN IMMEDIATE reserves the write lock before the SELECT, so two
+        # concurrent connections can never select the same row. The item is
+        # returned only after COMMIT succeeds; on any failure the transaction
+        # is rolled back and the item stays in the queue, never handed out.
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._db.execute(self._sql_pop).fetchone()
+            if row is None:
+                self._db.execute("COMMIT")
+                return None
+            id_, item = row
+            self._db.execute(self._sql_del, (id_,))
+            self._db.execute("COMMIT")
+        except BaseException:  # noqa: BLE001
+            with suppress(Exception):
+                self._db.execute("ROLLBACK")
+            raise
+        return cast("bytes", item)
 
     def peek(self) -> bytes | None:
-        with self._db as conn:
-            for _, item in conn.execute(self._sql_pop):
-                return cast("bytes", item)
-        return None
+        row = self._db.execute(self._sql_pop).fetchone()
+        return cast("bytes", row[1]) if row is not None else None
 
     def clear(self) -> None:
-        with self._db as conn:
-            conn.execute(self._sql_clear)
+        self._db.execute(self._sql_clear)
 
     def close(self) -> None:
-        size = len(self)
+        empty = len(self) == 0
         self._db.close()
-        if not size:
+        if not self._shared and empty:
             self._path.unlink()
 
     def __len__(self) -> int:
-        with self._db as conn:
-            return cast("int", next(conn.execute(self._sql_size))[0])
+        return cast("int", next(self._db.execute(self._sql_size))[0])
 
 
 class LifoSQLiteQueue(FifoSQLiteQueue):

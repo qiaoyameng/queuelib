@@ -90,6 +90,27 @@ Here is an example usage of the FIFO queue::
 The other disk queue classes have the same API, and the LIFO ones pop the item
 that was pushed last.
 
+Sharing a SQLite queue between processes
+---------------------------------------
+
+``FifoSQLiteQueue`` and ``LifoSQLiteQueue`` accept ``shared=True`` for the
+case where several workers use the same database file at the same time, in
+the same process or in different ones::
+
+    q = FifoSQLiteQueue("queue.sqlite3", shared=True)
+
+In shared mode every ``pop()`` is atomic: two connections can never be
+handed the same item, and an item is returned only once its deletion has
+been committed, so a failed commit keeps the item in the queue instead of
+losing it or delivering it twice. ``close()`` never deletes the file of an
+empty shared queue, since another connection may still be using it; remove
+the file yourself once every worker is done.
+
+``lock_timeout`` (default 60 seconds) bounds how long a ``push()`` or a
+``pop()`` waits for a database lock held by another connection. When the
+wait exceeds it, the call raises ``sqlite3.OperationalError``; a lock wait
+is never reported as an empty queue, so ``None`` always means "no item".
+
 PriorityQueue
 =============
 
@@ -228,7 +249,8 @@ popped, delete files that still contain items, or raise an exception. Queuelib
 offers no way to repair or to recover such a queue.
 
 A SQLite queue that is not closed keeps every item that was pushed. It still
-needs ``close()`` to delete the file of an empty queue.
+needs ``close()`` to delete the file of an empty, non-shared queue. A queue
+opened with ``shared=True`` always keeps its file.
 
 A failed push corrupts a file queue
 -----------------------------------
@@ -250,6 +272,10 @@ Empty queues delete their files
 ``FifoDiskQueue``, its chunk files and its ``info.json`` file, and also its
 directory if nothing else remains in it. Using that same path again creates a
 new, empty queue.
+
+A SQLite queue opened with ``shared=True`` is the exception: ``close()``
+always keeps its file, even when empty, because another connection may still
+be using it. Delete the file explicitly once all workers have closed it.
 
 FifoDiskQueue frees disk space one chunk at a time
 --------------------------------------------------
@@ -273,16 +299,20 @@ Use one queue object per path at a time
 ---------------------------------------
 
 On top of not being thread-safe, a given path must not be used by more than one
-open queue object at a time, in the same process or not.
+open queue object at a time, in the same process or not. The exception is
+``FifoSQLiteQueue`` and ``LifoSQLiteQueue`` opened with ``shared=True``,
+which support concurrent queue objects, including in different processes;
+see `Sharing a SQLite queue between processes`_.
 
 ``FifoDiskQueue`` and ``LifoDiskQueue`` do not lock the files that they use, so
 such queue objects overwrite each other's items and bookkeeping; for example,
 two ``FifoDiskQueue`` objects on the same directory return the same items, and
 their ``close()`` calls may raise ``FileNotFoundError``.
 
-SQLite serializes access to its file, but ``pop()`` on a SQLite queue reads and
-deletes an item in separate steps, so concurrent queue objects on the same path
-may return the same item more than once.
+SQLite serializes access to its file. In the default, non-shared mode
+``pop()`` reads and deletes an item in separate steps, so concurrent queue
+objects on the same path may return the same item more than once; open the
+queue with ``shared=True`` when that is a possibility.
 
 Persisting a PriorityQueue or a RoundRobinQueue
 -----------------------------------------------
