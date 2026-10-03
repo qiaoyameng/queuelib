@@ -90,6 +90,40 @@ Here is an example usage of the FIFO queue::
 The other disk queue classes have the same API, and the LIFO ones pop the item
 that was pushed last.
 
+Durable FIFO disk queue
+-----------------------
+
+By default, ``FifoDiskQueue`` only records its push/pop position when
+``close()`` is called. Pass ``durable=True`` and call ``commit()`` to make
+that position durable at any point, without closing the queue::
+
+    >>> q = FifoDiskQueue("queue-dir", durable=True)
+    >>> q.push(b'a')
+    >>> q.commit()
+
+Once ``commit()`` returns, every pushed record is on disk and every popped
+record stays consumed, even if the process is killed immediately after,
+without calling ``close()``. Reopening the same path restores exactly the
+committed state; pushes and pops performed after the last ``commit()`` are
+rolled back::
+
+    >>> q.push(b'b')
+    >>> q.pop()
+    b'a'
+    >>> del q  # process exits without commit() or close()
+    >>> q = FifoDiskQueue("queue-dir", durable=True)
+    >>> q.pop()
+    b'a'
+
+Durability is implemented by flushing the chunk data, publishing ``info.json``
+atomically (write to a temporary file, fsync, rename, fsync the directory), and
+only then deleting fully consumed chunk files. A torn, unfinished write at the
+tail of a chunk is never treated as a valid record; only the uncommitted tail
+of the active chunk is trimmed on open. Other on-disk inconsistencies raise
+``FifoDiskQueueError`` instead of discarding the queue, so committed data is
+not silently lost. In non-durable mode (the default), ``commit()`` is still
+available as a best-effort, non-fsynced position save.
+
 PriorityQueue
 =============
 

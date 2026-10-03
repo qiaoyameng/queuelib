@@ -2,6 +2,7 @@ __version__ = "1.10.0"
 
 from queuelib.pqueue import PriorityQueue
 from queuelib.queue import (
+    FifoDiskQueueError,
     FifoDiskQueue,
     FifoMemoryQueue,
     FifoSQLiteQueue,
@@ -12,6 +13,7 @@ from queuelib.queue import (
 from queuelib.rrqueue import RoundRobinQueue
 
 __all__ = [
+    "FifoDiskQueueError",
     "FifoDiskQueue",
     "FifoMemoryQueue",
     "FifoSQLiteQueue",

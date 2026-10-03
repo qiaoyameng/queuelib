@@ -1,6 +1,18 @@
 Queuelib release notes
 ======================
 
+Unreleased
+----------
+
+* Added an optional durable mode to ``FifoDiskQueue``: ``durable=True`` and
+  ``commit()`` persist the current push/pop position atomically, so the queue
+  can be reopened after a hard process exit with no committed push lost and no
+  committed pop resurrected. Metadata is published to ``info.json``
+  atomically, fully consumed chunks are reaped only after the metadata that
+  advances past them is durable, torn tail records are never read, and other
+  on-disk corruption raises the new ``FifoDiskQueueError`` instead of clearing
+  the queue
+
 Version 1.10.0
 ---------------
 (released on 2026-08-24)
