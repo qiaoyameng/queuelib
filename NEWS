@@ -1,6 +1,18 @@
 Queuelib release notes
 ======================
 
+Unreleased
+----------
+
+* Added ``RoundRobinCheckpoint`` and ``RoundRobinQueue.close(checkpoint=True)``
+  to persist the active keys together with the round-robin rotation position,
+  so a restarted queue resumes the original serving order
+* ``RoundRobinQueue`` now accepts a ``checkpoint`` argument; corrupted
+  checkpoints (duplicated or unhashable keys, out-of-range positions) raise
+  ``ValueError``
+* ``RoundRobinQueue.pop()`` keeps a key scheduled when its subqueue
+  ``close()`` fails instead of silently losing its position
+
 Version 1.10.0
 ---------------
 (released on 2026-08-24)

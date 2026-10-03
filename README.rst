@@ -148,6 +148,46 @@ And use it::
     >>> rr.pop()
     b'd'
 
+Restarting with a checkpoint
+----------------------------
+
+``close(checkpoint=True)`` closes the internal queues, like ``close()``, and
+additionally returns a :class:`~queuelib.RoundRobinCheckpoint`. Unlike the
+plain list of active keys returned by ``close()``, a checkpoint also remembers
+which key is due next, so a restarted queue keeps serving keys in exactly the
+same round-robin order::
+
+    >>> rr.push(b'a', '1')
+    >>> rr.push(b'b', '2')
+    >>> rr.push(b'c', '1')
+    >>> rr.pop()
+    b'a'
+    >>> checkpoint = rr.close(checkpoint=True)
+    >>> checkpoint.keys
+    ('2', '1')
+
+The first key of a fresh checkpoint is the one that would be popped next.
+Pass the checkpoint when opening the queue again, and the rotation continues
+where it stopped::
+
+    >>> rr = RoundRobinQueue(qfactory, checkpoint=checkpoint)
+    >>> rr.pop()
+    b'b'
+    >>> rr.pop()
+    b'c'
+
+Checkpoint keys are used verbatim: they are not encoded or turned into
+strings, so keys of any hashable type (integers, tuples, ...) round-trip
+unchanged. A checkpoint can also be built from a mapping (e.g. one loaded from
+JSON) or a plain sequence of keys. Duplicated keys, unhashable keys, and
+out-of-range positions are rejected with :class:`ValueError` before any
+internal queue is opened. If a ``qfactory`` call or an internal ``close()``
+fails, no checkpoint is produced: the exception propagates instead of leaving
+a checkpoint that would not match the data on disk.
+
+The legacy ``start_domains`` argument keeps working unchanged for callers that
+only need to reopen the active keys without restoring the rotation position.
+
 Clearing a queue
 ================
 

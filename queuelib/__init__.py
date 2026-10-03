@@ -9,7 +9,7 @@ from queuelib.queue import (
     LifoMemoryQueue,
     LifoSQLiteQueue,
 )
-from queuelib.rrqueue import RoundRobinQueue
+from queuelib.rrqueue import RoundRobinCheckpoint, RoundRobinQueue
 
 __all__ = [
     "FifoDiskQueue",
@@ -19,5 +19,6 @@ __all__ = [
     "LifoMemoryQueue",
     "LifoSQLiteQueue",
     "PriorityQueue",
+    "RoundRobinCheckpoint",
     "RoundRobinQueue",
 ]
