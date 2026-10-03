@@ -315,6 +315,30 @@ back as ``startprios`` or ``start_domains`` on the next run::
 Priorities and keys that you do not pass back are not detected, and the items
 in their queues stay on disk, unreachable.
 
+``RoundRobinQueue.close()`` returns a ``RoundRobinCheckpoint`` instead of a
+plain list: it holds the active keys in rotation order, so that the next run
+keeps cycling through the keys where the previous run left off. Pass it back
+as ``start_domains`` or as the ``checkpoint`` argument::
+
+    >>> from queuelib import RoundRobinCheckpoint, RoundRobinQueue
+    >>> rq = RoundRobinQueue(qfactory)
+    >>> rq.push(b'a', 'example.com')
+    >>> checkpoint = rq.close()
+    >>> with open('checkpoint.json', 'w') as f:
+    ...     json.dump(list(checkpoint), f)
+    ...
+    >>> with open('checkpoint.json') as f:
+    ...     checkpoint = RoundRobinCheckpoint(tuple(json.load(f)))
+    ...
+    >>> rq = RoundRobinQueue(qfactory, checkpoint=checkpoint)
+
+Keys are stored as-is in the checkpoint, they are never coerced to strings;
+encoding and decoding them for storage is your responsibility. A checkpoint
+with duplicate keys or otherwise invalid data is rejected when the queue is
+built, and if closing an internal queue fails, ``close()`` raises instead of
+returning a checkpoint, so a stored checkpoint always describes a cleanly
+closed queue.
+
 Bug tracker
 ===========
 

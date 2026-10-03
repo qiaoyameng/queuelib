@@ -1,6 +1,15 @@
 Queuelib release notes
 ======================
 
+Version 1.11.0
+---------------
+(unreleased)
+
+* Added ``RoundRobinCheckpoint``: ``RoundRobinQueue.close()`` now returns a
+  scheduling checkpoint that records the active keys and their rotation
+  position, and passing it back (as ``start_domains`` or as the new
+  ``checkpoint`` argument) resumes the round robin cycle where it stopped
+
 Version 1.10.0
 ---------------
 (released on 2026-08-24)
