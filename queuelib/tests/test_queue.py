@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import multiprocessing
+import sqlite3
 from abc import abstractmethod
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -433,3 +436,174 @@ class LifoSQLiteQueueTest(
 ):
     def queue(self):
         return LifoSQLiteQueue(self.qpath)
+
+
+def _sqlite_shared_worker(qpath, barrier, closed_event, results, role):
+    """Pop every item from a shared SQLite queue, then exercise close()."""
+    queue = FifoSQLiteQueue(qpath, shared=True, timeout=30)
+    popped = []
+    barrier.wait(timeout=30)
+    while True:
+        item = queue.pop()
+        if item is None:
+            break
+        popped.append(item)
+    if role == "closer":
+        queue.close()
+        closed_event.set()
+    else:
+        if not closed_event.wait(timeout=30):
+            raise RuntimeError("the other worker did not close in time")
+        if not Path(qpath).exists():
+            raise RuntimeError("shared close() removed the database file")
+        extra = [f"extra-{n}".encode() for n in range(5)]
+        for marker in extra:
+            queue.push(marker)
+        for marker in extra:
+            item = queue.pop()
+            if item != marker:
+                raise RuntimeError(f"expected {marker!r}, got {item!r}")
+        if queue.pop() is not None:
+            raise RuntimeError("queue should be empty after popping extras")
+        queue.close()
+    results.put(popped)
+
+
+class SQLiteSharedModeTest(QueuelibTestCase):
+    def queue(self, cls=FifoSQLiteQueue, **kwargs):
+        kwargs.setdefault("shared", True)
+        return cls(self.qpath, **kwargs)
+
+    def test_close_keeps_file_when_empty(self):
+        for cls in (FifoSQLiteQueue, LifoSQLiteQueue):
+            q = self.queue(cls=cls)
+            q.push(b"a")
+            assert q.pop() == b"a"
+            q.close()
+            assert self.qpath.exists()
+            self.qpath.unlink()
+
+    def test_close_keeps_file_for_other_connections(self):
+        q1 = self.queue()
+        q2 = self.queue()
+        q1.push(b"a")
+        q1.close()
+        assert self.qpath.exists()
+        assert q2.pop() == b"a"
+        q2.close()
+        assert self.qpath.exists()
+
+    def test_empty_bytes_vs_no_record(self):
+        for cls in (FifoSQLiteQueue, LifoSQLiteQueue):
+            q = self.queue(cls=cls)
+            q.push(b"")
+            item = q.pop()
+            assert item is not None
+            assert item == b""
+            assert q.pop() is None
+            q.close()
+            self.qpath.unlink()
+
+    def test_pop_is_atomic_across_connections(self):
+        q1 = self.queue()
+        q2 = self.queue()
+        q1.push(b"only-item")
+        results = {q1.pop(), q2.pop()}
+        assert results == {b"only-item", None}
+        q1.close()
+        q2.close()
+
+    def test_lock_timeout_raises_instead_of_empty(self):
+        q = self.queue(timeout=0.1)
+        q.push(b"a")
+        locker = sqlite3.Connection(self.qpath, timeout=0.1)
+        locker.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                q.pop()
+        finally:
+            locker.rollback()
+            locker.close()
+        assert q.pop() == b"a"
+        q.close()
+
+    def test_failed_commit_does_not_return_item(self):
+        class FailingCommitConnection:
+            def __init__(self, db):
+                self._db = db
+
+            def execute(self, *args, **kwargs):
+                return self._db.execute(*args, **kwargs)
+
+            def commit(self):
+                raise sqlite3.OperationalError("boom")
+
+            def rollback(self):
+                self._db.rollback()
+
+        q = self.queue()
+        q.push(b"a")
+        with (
+            mock.patch.object(q, "_db", FailingCommitConnection(q._db)),
+            pytest.raises(sqlite3.OperationalError),
+        ):
+            q.pop()
+        assert q.pop() == b"a"
+        q.close()
+
+    def test_configurable_timeout(self):
+        q = self.queue(timeout=7)
+        assert q._db.execute("PRAGMA busy_timeout").fetchone()[0] == 7000
+        q.close()
+
+    def test_fifo_order_preserved(self):
+        q = self.queue()
+        for n in range(10):
+            q.push(f"m{n}".encode())
+        assert [q.pop() for _ in range(10)] == [f"m{n}".encode() for n in range(10)]
+        q.close()
+
+    def test_lifo_order_preserved(self):
+        q = self.queue(cls=LifoSQLiteQueue)
+        for n in range(10):
+            q.push(f"m{n}".encode())
+        assert [q.pop() for _ in range(10)] == [
+            f"m{n}".encode() for n in reversed(range(10))
+        ]
+        q.close()
+
+    def test_concurrent_pop_two_processes(self):
+        markers = [f"marker-{n}".encode() for n in range(200)]
+        q = self.queue()
+        for marker in markers:
+            q.push(marker)
+        q.close()
+        assert self.qpath.exists()
+
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(2)
+        closed_event = ctx.Event()
+        results = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=_sqlite_shared_worker,
+                args=(str(self.qpath), barrier, closed_event, results, role),
+            )
+            for role in ("closer", "continuer")
+        ]
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(timeout=120)
+            assert proc.exitcode == 0
+
+        popped = []
+        while not results.empty():
+            popped.extend(results.get())
+        assert len(popped) == len(markers)
+        assert sorted(popped) == sorted(markers)
+
+        # The file survives shared close(); clean it up explicitly.
+        assert self.qpath.exists()
+        self.qpath.unlink()
+        assert not self.qpath.exists()

@@ -296,9 +296,28 @@ class FifoSQLiteQueue:
     _sql_del = "DELETE FROM queue WHERE id = ?"
     _sql_clear = "DELETE FROM queue"
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        timeout: float = 60,
+        shared: bool = False,
+    ) -> None:
+        """Open the queue stored at *path*.
+
+        *timeout* is the maximum number of seconds to wait for the database
+        lock held by another connection before raising
+        :exc:`sqlite3.OperationalError`.
+
+        When *shared* is true, multiple queue objects, from the same process
+        or from different ones, may use the same file at once: ``pop()``
+        becomes atomic, so no item is returned by two connections, and
+        ``close()`` never deletes the database file, even if the queue is
+        empty at that point. Deleting the file is left to the caller.
+        """
         self._path = Path(path).resolve()
-        self._db = sqlite3.Connection(self._path, timeout=60)
+        self._shared = shared
+        self._db = sqlite3.Connection(self._path, timeout=timeout)
         self._db.text_factory = bytes
         with self._db as conn:
             conn.execute(self._sql_create)
@@ -310,11 +329,25 @@ class FifoSQLiteQueue:
             conn.execute(self._sql_push, (item,))
 
     def pop(self) -> bytes | None:
-        with self._db as conn:
-            for id_, item in conn.execute(self._sql_pop):
-                conn.execute(self._sql_del, (id_,))
-                return cast("bytes", item)
-        return None
+        # BEGIN IMMEDIATE takes the database write lock before reading, so
+        # the SELECT and the DELETE below are atomic with respect to other
+        # connections: no two connections can pop the same item. If the lock
+        # cannot be taken within the configured timeout, or if the commit
+        # fails, the exception propagates and no item is returned.
+        conn = self._db
+        row = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(self._sql_pop).fetchone()
+            if row is not None:
+                conn.execute(self._sql_del, (row[0],))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        if row is None:
+            return None
+        return cast("bytes", row[1])
 
     def peek(self) -> bytes | None:
         with self._db as conn:
@@ -327,6 +360,11 @@ class FifoSQLiteQueue:
             conn.execute(self._sql_clear)
 
     def close(self) -> None:
+        if self._shared:
+            # Other queue objects may still be using the file, so it must
+            # not be deleted even if the queue is currently empty.
+            self._db.close()
+            return
         size = len(self)
         self._db.close()
         if not size:

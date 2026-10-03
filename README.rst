@@ -251,6 +251,11 @@ Empty queues delete their files
 directory if nothing else remains in it. Using that same path again creates a
 new, empty queue.
 
+The exception are SQLite queues open with ``shared=True``: their ``close()``
+never deletes the database file, since other queue objects may still be using
+it. Deleting that file, once no queue object is using it anymore, is left to
+you.
+
 FifoDiskQueue frees disk space one chunk at a time
 --------------------------------------------------
 
@@ -283,6 +288,32 @@ their ``close()`` calls may raise ``FileNotFoundError``.
 SQLite serializes access to its file, but ``pop()`` on a SQLite queue reads and
 deletes an item in separate steps, so concurrent queue objects on the same path
 may return the same item more than once.
+
+Sharing a SQLite queue
+----------------------
+
+``FifoSQLiteQueue`` and ``LifoSQLiteQueue`` are the exception to the rule
+above: open them with ``shared=True`` and any number of queue objects, from
+the same process or from different ones, may use the same database file at
+once::
+
+    from queuelib import FifoSQLiteQueue
+
+    q = FifoSQLiteQueue("queue.db", shared=True)
+
+In shared mode ``pop()`` reads and deletes the item within a single immediate
+transaction, so no two queue objects ever return the same item. If the
+transaction cannot be committed, the item stays in the queue and the exception
+propagates instead of the item being handed out.
+
+Operations that need the database lock wait for it up to ``timeout`` seconds
+(60 by default) and then raise ``sqlite3.OperationalError``; a busy database
+is never reported as an empty queue. Lower ``timeout`` if you prefer to fail
+fast when another process holds the lock for long.
+
+Since any of the sharing processes may outlive the others, ``close()`` in
+shared mode never deletes the database file, not even when the queue is
+empty. Delete the file yourself once every process is done with it.
 
 Persisting a PriorityQueue or a RoundRobinQueue
 -----------------------------------------------
